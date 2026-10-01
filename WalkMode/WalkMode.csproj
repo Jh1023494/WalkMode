@@ -17,8 +17,8 @@
   
   <PropertyGroup>
     <!-- Specifies information for Assembly and Yak -->
-    <Version>1.0.1</Version>
-    <InformationalVersion>1.0.1</InformationalVersion>
+    <Version>1.0.3</Version>
+    <InformationalVersion>1.0.3</InformationalVersion>
     <Title>WalkMode</Title>
     <Company>rheinason</Company>
     <Description>First-person walkthrough mode with WASD movement, mouse look, gravity, teleport, and adjustable speed</Description>
@@ -48,7 +48,7 @@
     <Exec Command="&quot;$(YakExecutable)&quot; spec" WorkingDirectory="$(OutputPath)" Condition="$(BuildYakPackage) == 'True'" />
     <!-- yak spec doesn't read PackageProjectUrl, so patch it in -->
     <Exec Command="powershell -NoProfile -Command &quot;(Get-Content '$(OutputPath)manifest.yml') -replace '^url:.*$','url: $(PackageProjectUrl)' | Set-Content '$(OutputPath)manifest.yml'&quot;" Condition="$(BuildYakPackage) == 'True' and '$(PackageProjectUrl)' != ''" />
-    <Exec Command="&quot;$(YakExecutable)&quot; build" WorkingDirectory="$(OutputPath)" Condition="$(BuildYakPackage) == 'True'" />
+    <Exec Command="&quot;$(YakExecutable)&quot; build --platform win" WorkingDirectory="$(OutputPath)" Condition="$(BuildYakPackage) == 'True'" />
 
   </Target>
 

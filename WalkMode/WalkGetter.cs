@@ -20,10 +20,35 @@ namespace WalkMode
         [DllImport("user32.dll", EntryPoint = "ShowCursor")]
         static extern int ShowCursorWin32(bool bShow);
         [DllImport("user32.dll")]  static extern bool   ClientToScreen(IntPtr hWnd, ref System.Drawing.Point lpPoint);
-        [DllImport("user32.dll")]  static extern IntPtr SetWindowsHookEx(int idHook, LowLevelProc lpfn, IntPtr hMod, uint dwThreadId);
-        [DllImport("user32.dll")]  static extern bool   UnhookWindowsHookEx(IntPtr hhk);
-        [DllImport("user32.dll")]  static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-        [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string lpModuleName);
+        [DllImport("user32.dll")]  static extern bool   GetCursorPos(out POINT lpPoint);
+        [DllImport("user32.dll")]  static extern bool   ClipCursor(ref RECT lpRect);
+        [DllImport("user32.dll", EntryPoint = "ClipCursor")]
+        static extern bool ClipCursorNone(IntPtr lpRect);
+        [DllImport("user32.dll")]  static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")]  static extern uint   GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+        [DllImport("user32.dll")]  static extern bool   UpdateWindow(IntPtr hWnd);
+
+        // Raw input
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] devices, uint count, uint size);
+        [DllImport("user32.dll")]
+        static extern uint GetRawInputData(IntPtr hRawInput, uint command, IntPtr data, ref uint size, uint headerSize);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct RAWINPUTDEVICE
+        {
+            public ushort UsagePage;
+            public ushort Usage;
+            public uint   Flags;
+            public IntPtr Target;
+        }
+
+        const uint RID_INPUT             = 0x10000003;
+        const uint RIM_TYPEMOUSE         = 0;
+        const uint RIDEV_REMOVE          = 0x00000001;
+        const ushort MOUSE_MOVE_ABSOLUTE = 0x0001;
+        // RAWINPUTHEADER: DWORD dwType, DWORD dwSize, HANDLE hDevice, WPARAM wParam
+        static readonly int RawHeaderSize = 8 + 2 * IntPtr.Size;
         [DllImport("winmm.dll")]   static extern int    timeBeginPeriod(int uPeriod);
         [DllImport("winmm.dll")]   static extern int    timeEndPeriod(int uPeriod);
 
@@ -58,28 +83,25 @@ namespace WalkMode
             public POINT  pt;
         }
 
-        // Low-level hook IDs and message codes
-        const int WH_KEYBOARD_LL = 13;
-        const int WH_MOUSE_LL    = 14;
-        const int WM_KEYDOWN     = 0x0100;
-        const int WM_KEYUP       = 0x0101;
-        const int WM_MOUSEMOVE   = 0x0200;
-        const int WM_RBUTTONDOWN = 0x0204;
-        const int WM_MOUSEWHEEL  = 0x020A;
-
-        delegate IntPtr LowLevelProc(int nCode, IntPtr wParam, IntPtr lParam);
+        // Window message codes
+        const uint WM_INPUT        = 0x00FF;
+        const uint WM_KEYDOWN      = 0x0100;
+        const uint WM_KEYUP        = 0x0101;
+        const uint WM_SYSKEYDOWN   = 0x0104;
+        const uint WM_SYSKEYUP     = 0x0105;
+        const uint WM_NCMOUSEFIRST = 0x00A0;
+        const uint WM_NCMOUSELAST  = 0x00AD;
+        const uint WM_MOUSEFIRST   = 0x0200;
+        const uint WM_RBUTTONDOWN  = 0x0204;
+        const uint WM_RBUTTONUP    = 0x0205;
+        const uint WM_MOUSEWHEEL   = 0x020A;
+        const uint WM_MOUSELAST    = 0x020E;
 
         [StructLayout(LayoutKind.Sequential)]
         struct POINT { public int x, y; }
 
         [StructLayout(LayoutKind.Sequential)]
-        struct MSLLHOOKSTRUCT
-        {
-            public POINT  pt;
-            public int    mouseData;
-            public int    flags, time;
-            public UIntPtr dwExtraInfo;
-        }
+        struct RECT { public int left, top, right, bottom; }
 
         // ── Context ───────────────────────────────────────────────────────────
         readonly RhinoDoc      _doc;
@@ -92,6 +114,7 @@ namespace WalkMode
 
         // ── Cancel restore ────────────────────────────────────────────────────
         readonly ViewportInfo _savedViewport;
+        readonly Point3d _savedCameraTarget;
 
         // ── Unit scale (doc units per metre) ─────────────────────────────────
         double _unitsPerMeter;
@@ -101,20 +124,29 @@ namespace WalkMode
 
         // ── Cursor / screen centre ────────────────────────────────────────────
         System.Drawing.Point     _screenCenter;
-        System.Drawing.Point     _lastMousePt;
+        RECT                     _screenClip;
         System.Drawing.Rectangle _lastBounds;
+        bool                     _hadFocus;
+        readonly uint            _pid;
 
         // ── Frame timing ──────────────────────────────────────────────────────
         const int FrameIntervalMs = 4;
-        const double LookSensitivity = 0.0025;
+        // Yield to the camera even when a high-polling-rate device keeps the
+        // queue busy. Messages left over are processed on the next pass.
+        const double MessagePumpBudgetMs = 2;
+        const double LookSensitivity    = 0.0025;   // rad per cursor pixel
+        // Raw counts skip Windows pointer speed; the robot bench measured raw
+        // turning ~1.7x faster than cursor mode on the same input, so scale
+        // down to keep the feel tuned in cursor mode.
+        const double RawLookSensitivity = 0.0015;   // rad per raw count
         readonly Stopwatch _sw = Stopwatch.StartNew();
         long _lastTickMs;
 
-        // ── Input state — written by hook callbacks, read by physics tick ─────
-        int _mouseDx, _mouseDy;
+        // ── Input state — written by the message filter, read by physics tick ─
         bool _kW, _kA, _kS, _kD, _kQ, _kE, _kShift, _kAlt;
         bool _tabEdge, _vEdge, _spaceEdge;
         bool _kTabDown, _kVDown, _kSpaceDown;
+        bool _rButtonDown;
 
         // ── Exit flags (replace GetPoint's Get() return) ─────────────────────
         bool _exitRequested;
@@ -151,13 +183,6 @@ namespace WalkMode
         EventHandler<RhinoModifyObjectAttributesEventArgs> _attrHandler;
         EventHandler<LayerTableEventArgs>                  _layerHandler;
 
-        // ── Low-level hooks ───────────────────────────────────────────────────
-        LowLevelProc _hookProc;
-        IntPtr       _kHook = IntPtr.Zero;
-        IntPtr       _mHook = IntPtr.Zero;
-
-        // ── Physics/render timer ──────────────────────────────────────────────
-
         // ── Display conduit ───────────────────────────────────────────────────
         WalkConduit _conduit;
 
@@ -169,6 +194,21 @@ namespace WalkMode
 
         // ── Sticky speed ──────────────────────────────────────────────────────
         static double s_lastSpeed = 0;
+
+        // ── Mouse input method (toggled by the WalkInputMode command) ─────────
+        // false: read the cursor each frame and warp it back to centre.
+        // true:  accumulate WM_INPUT deltas straight from the device.
+        internal static bool UseRawInput = true;
+
+        /// <summary>True while the walk message pump is running (read by WalkBenchRobot).</summary>
+        internal static volatile bool IsRunning;
+
+        /// <summary>Move/look via Rhino mouse-nav calls (toggled by WalkInputMode for A/B).</summary>
+        internal static bool UseMouseNav = true;
+        int  _rawDx, _rawDy;
+        bool _rawRegistered;
+        IntPtr _rawInputBuffer;
+        const int RawInputBufferSize = 64;
 
         // ── Display conduit for crosshair + status HUD ────────────────────────
         sealed class WalkConduit : DisplayConduit
@@ -195,8 +235,11 @@ namespace WalkMode
                     return;
                 }
 
+                var rec = FrameRecorder.Active;
+                double t0 = rec?.NowMs ?? 0;
                 DrawCrosshair(e);
                 DrawStatus(e);
+                if (rec != null) FrameRecorder.Sample("walk.hud ms", rec.NowMs - t0);
             }
 
             void DrawCrosshair(DrawEventArgs e)
@@ -245,6 +288,7 @@ namespace WalkMode
             _vp   = view.ActiveViewport;
 
             _savedViewport = new ViewportInfo(_vp);
+            _savedCameraTarget = _vp.CameraTarget;
 
             _unitsPerMeter = RhinoMath.UnitScale(UnitSystem.Meters, _doc.ModelUnitSystem);
 
@@ -270,24 +314,15 @@ namespace WalkMode
             _nearClip = 0.1 * _unitsPerMeter;
             ComputeScreenCenter();
 
-            // Install hooks early so keys are consumed during geometry loading
-            _hookProc = HookCallback;
             using (var proc = Process.GetCurrentProcess())
-            using (var mod  = proc.MainModule)
-            {
-                var hMod = GetModuleHandle(mod.ModuleName);
-                _kHook = SetWindowsHookEx(WH_KEYBOARD_LL, _hookProc, hMod, 0);
-                _mHook = SetWindowsHookEx(WH_MOUSE_LL,    _hookProc, hMod, 0);
-            }
+                _pid = (uint)proc.Id;
 
-            // Enable conduit before geometry load so "Loading..." is visible
             _conduit = new WalkConduit(this);
             _conduit.Enabled = true;
-            _loading = true;
-            _view.Redraw();
-
-            BuildGeometryCache();
-            _loading = false;
+            _redrawPending = true;
+            // Only gravity uses the collision meshes. Fly mode and teleport
+            // (which uses the depth buffer) can start without building them.
+            _geometryDirty = true;
 
             _objHandler     = (s, e) => _geometryDirty = true;
             _replaceHandler = (s, e) => _geometryDirty = true;
@@ -361,16 +396,23 @@ namespace WalkMode
 
         Point3d? ShootRay(Ray3d ray)
         {
-            if (_geometryDirty)
+            if (_meshGeometry == null || _geometryDirty)
             {
                 var now = DateTime.UtcNow;
-                if ((now - _lastGeometryRebuild).TotalSeconds >= 0.5)
+                if (_meshGeometry == null || (now - _lastGeometryRebuild).TotalSeconds >= 0.5)
                 {
                     _loading = true;
-                    _view.Redraw();
-                    BuildGeometryCache();
-                    _loading = false;
-                    _lastGeometryRebuild = now;
+                    try
+                    {
+                        RedrawNow(_view);
+                        BuildGeometryCache();
+                        _lastGeometryRebuild = now;
+                    }
+                    finally
+                    {
+                        _loading = false;
+                        _redrawPending = true;
+                    }
                 }
             }
 
@@ -399,10 +441,66 @@ namespace WalkMode
             var pt = new System.Drawing.Point(
                 bounds.X + bounds.Width  / 2,
                 bounds.Y + bounds.Height / 2);
+            var tl = new System.Drawing.Point(bounds.Left,  bounds.Top);
+            var br = new System.Drawing.Point(bounds.Right, bounds.Bottom);
             if (_view.Handle != IntPtr.Zero)
+            {
                 ClientToScreen(_view.Handle, ref pt);
+                ClientToScreen(_view.Handle, ref tl);
+                ClientToScreen(_view.Handle, ref br);
+            }
             _screenCenter = pt;
-            _lastMousePt  = pt;
+            _screenClip   = UseRawInput
+                // Raw deltas don't need the cursor to move: pin it in place.
+                ? new RECT { left = pt.X, top = pt.Y, right = pt.X + 1, bottom = pt.Y + 1 }
+                : new RECT { left = tl.X, top = tl.Y, right = br.X, bottom = br.Y };
+        }
+
+        bool RegisterRawMouse(bool register)
+        {
+            var dev = new[]
+            {
+                new RAWINPUTDEVICE
+                {
+                    UsagePage = 0x01,   // generic desktop
+                    Usage     = 0x02,   // mouse
+                    Flags     = register ? 0 : RIDEV_REMOVE,
+                    Target    = register ? _view.Handle : IntPtr.Zero,
+                }
+            };
+            return RegisterRawInputDevices(dev, 1, (uint)Marshal.SizeOf<RAWINPUTDEVICE>());
+        }
+
+        void ReadRawInput(IntPtr hRawInput)
+        {
+            // Reuse storage: gaming mice can send thousands of packets/sec.
+            // RAWINPUTHEADER + RAWMOUSE fits in 64 bytes on both bitnesses.
+            if (_rawInputBuffer == IntPtr.Zero)
+                _rawInputBuffer = Marshal.AllocHGlobal(RawInputBufferSize);
+            uint size = RawInputBufferSize;
+            uint got = GetRawInputData(hRawInput, RID_INPUT, _rawInputBuffer, ref size, (uint)RawHeaderSize);
+            if (got == uint.MaxValue || got < RawHeaderSize + 20) return;
+            if ((uint)Marshal.ReadInt32(_rawInputBuffer, 0) != RIM_TYPEMOUSE) return;
+
+            // RAWMOUSE: USHORT usFlags, (pad), ULONG buttons, ULONG rawButtons, LONG lLastX, LONG lLastY
+            ushort flags = (ushort)Marshal.ReadInt16(_rawInputBuffer, RawHeaderSize);
+            if ((flags & MOUSE_MOVE_ABSOLUTE) != 0) return;   // tablets / remote desktop
+            _rawDx += Marshal.ReadInt32(_rawInputBuffer, RawHeaderSize + 12);
+            _rawDy += Marshal.ReadInt32(_rawInputBuffer, RawHeaderSize + 16);
+        }
+
+        bool RhinoHasFocus()
+        {
+            var fg = GetForegroundWindow();
+            if (fg == IntPtr.Zero) return false;
+            GetWindowThreadProcessId(fg, out uint pid);
+            return pid == _pid;
+        }
+
+        void ReleaseHeldKeys()
+        {
+            _kW = _kA = _kS = _kD = _kQ = _kE = _kShift = _kAlt = false;
+            _kTabDown = _kVDown = _kSpaceDown = _rButtonDown = false;
         }
 
         void OnWheelDelta(int delta)
@@ -414,95 +512,68 @@ namespace WalkMode
             _redrawPending = true;
         }
 
-        // ── Low-level hook callback ───────────────────────────────────────────
-        IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        // ── Input message filter ──────────────────────────────────────────────
+        // We own the message pump, so walk input is taken straight off the
+        // queue and never dispatched.  Returns true if the message was consumed.
+        bool FilterInput(ref MSG msg)
         {
-            if (nCode < 0)
-                return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+            uint m = msg.message;
 
-            int msg = (int)wParam;
-
-            // ── Keyboard ──────────────────────────────────────────────────────
-            if (msg == WM_KEYDOWN || msg == WM_KEYUP)
+            if (m == WM_KEYDOWN || m == WM_SYSKEYDOWN || m == WM_KEYUP || m == WM_SYSKEYUP)
             {
-                bool down = (msg == WM_KEYDOWN);
-                var  key  = (Keys)Marshal.ReadInt32(lParam);
-                bool consume = true;
-
-                switch (key)
+                bool down = (m == WM_KEYDOWN || m == WM_SYSKEYDOWN);
+                switch ((Keys)(int)msg.wParam)
                 {
-                    case Keys.W:                               _kW     = down; break;
-                    case Keys.A:                               _kA     = down; break;
-                    case Keys.S:                               _kS     = down; break;
-                    case Keys.D:                               _kD     = down; break;
-                    case Keys.Q:                               _kQ     = down; break;
-                    case Keys.E:                               _kE     = down; break;
-                    case Keys.LShiftKey: case Keys.RShiftKey:  _kShift = down; break;
-                    case Keys.LMenu:     case Keys.RMenu:      _kAlt   = down; break;
+                    case Keys.W:        _kW     = down; return true;
+                    case Keys.A:        _kA     = down; return true;
+                    case Keys.S:        _kS     = down; return true;
+                    case Keys.D:        _kD     = down; return true;
+                    case Keys.Q:        _kQ     = down; return true;
+                    case Keys.E:        _kE     = down; return true;
+                    case Keys.ShiftKey: _kShift = down; return true;
+                    case Keys.Menu:     _kAlt   = down; return true;
                     case Keys.Tab:
                         if (down && !_kTabDown) _tabEdge = true;
                         _kTabDown = down;
-                        break;
+                        return true;
                     case Keys.V:
                         if (down && !_kVDown) _vEdge = true;
                         _kVDown = down;
-                        break;
+                        return true;
                     case Keys.Space:
                         if (down && !_kSpaceDown) _spaceEdge = true;
                         _kSpaceDown = down;
-                        break;
+                        return true;
                     case Keys.Escape:
-                        if (down)
-                        {
-                            _cancelled     = true;
-                            _exitRequested = true;
-                        }
-                        break;
+                        if (down) { _cancelled = true; _exitRequested = true; }
+                        return true;
                     case Keys.Return:
-                        if (down)
-                        {
-                            _exitRequested = true;
-                        }
-                        break;
-                    default:
-                        consume = false;
-                        break;
+                        if (down) _exitRequested = true;
+                        return true;
                 }
-
-                if (consume) return new IntPtr(-1);
+                return false;
             }
-            // ── Mouse move ────────────────────────────────────────────────────
-            else if (msg == WM_MOUSEMOVE)
+
+            if (m >= WM_MOUSEFIRST && m <= WM_MOUSELAST)
             {
-                var data = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
-                int dx = data.pt.x - _lastMousePt.X;
-                int dy = data.pt.y - _lastMousePt.Y;
-                _lastMousePt = new System.Drawing.Point(data.pt.x, data.pt.y);
-                if (dx != 0 || dy != 0)
+                if (m == WM_RBUTTONDOWN)
                 {
-                    _mouseDx += dx;
-                    _mouseDy += dy;
-                    SetCursorPos(_screenCenter.X, _screenCenter.Y);
-                    _lastMousePt = _screenCenter;
+                    _rButtonDown = true;
                 }
-                return new IntPtr(-1);
-            }
-            // ── Right-click → accept view ─────────────────────────────────────
-            else if (msg == WM_RBUTTONDOWN)
-            {
-                _exitRequested = true;
-                return new IntPtr(-1);
-            }
-            // ── Scroll wheel ──────────────────────────────────────────────────
-            else if (msg == WM_MOUSEWHEEL)
-            {
-                var data  = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
-                int delta = (short)(data.mouseData >> 16);
-                OnWheelDelta(delta);
-                return new IntPtr(-1);
+                else if (m == WM_RBUTTONUP)
+                {
+                    // Accept on release so Rhino never sees a stray button-up.
+                    if (_rButtonDown) _exitRequested = true;
+                }
+                else if (m == WM_MOUSEWHEEL)
+                {
+                    OnWheelDelta((short)((long)msg.wParam >> 16));
+                }
+                // Mouse moves are read directly from the cursor each frame.
+                return true;
             }
 
-            return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+            return m >= WM_NCMOUSEFIRST && m <= WM_NCMOUSELAST;
         }
 
         // ── Physics timer tick (250 Hz) ──────────────────────────────────────
@@ -524,15 +595,45 @@ namespace WalkMode
             {
                 _lastBounds = currentBounds;
                 ComputeScreenCenter();
+                if (_hadFocus) ClipCursor(ref _screenClip);
             }
 
-            // ── Consume accumulated mouse deltas ─────────────────────────────
-            int mdx = _mouseDx, mdy = _mouseDy;
-            _mouseDx = 0; _mouseDy = 0;
+            // ── Mouse look: read all motion since the last frame at once ─────
+            bool hasFocus = RhinoHasFocus();
+            int mdx = 0, mdy = 0;
+            if (hasFocus && UseRawInput)
+            {
+                if (_hadFocus) { mdx = _rawDx; mdy = _rawDy; }
+                else           ClipCursor(ref _screenClip);
+            }
+            else if (hasFocus)
+            {
+                if (_hadFocus && GetCursorPos(out var cur))
+                {
+                    mdx = cur.x - _screenCenter.X;
+                    mdy = cur.y - _screenCenter.Y;
+                }
+                else
+                {
+                    ClipCursor(ref _screenClip);
+                }
+                if (mdx != 0 || mdy != 0 || !_hadFocus)
+                    SetCursorPos(_screenCenter.X, _screenCenter.Y);
+            }
+            else if (_hadFocus)
+            {
+                // Let the user work in other apps; don't carry held keys over.
+                ClipCursorNone(IntPtr.Zero);
+                ReleaseHeldKeys();
+            }
+            _hadFocus = hasFocus;
+            _rawDx = _rawDy = 0;
+
             if (mdx != 0 || mdy != 0)
             {
-                _yaw   += mdx * LookSensitivity;
-                _pitch -= mdy * LookSensitivity;
+                double sens = UseRawInput ? RawLookSensitivity : LookSensitivity;
+                _yaw   += mdx * sens;
+                _pitch -= mdy * sens;
                 const double maxPitch = 89.0 * Math.PI / 180.0;
                 if (_pitch >  maxPitch) _pitch =  maxPitch;
                 if (_pitch < -maxPitch) _pitch = -maxPitch;
@@ -549,9 +650,21 @@ namespace WalkMode
             if (_redrawPending)
             {
                 _redrawPending = false;
-                ApplyCamera();
-                AdjustFrustum();
-                _view.Redraw();
+                var rec = FrameRecorder.Active;
+                double t0 = rec?.NowMs ?? 0;
+                if (!NavigateViaMouse())
+                {
+                    FrameRecorder.Sample("walk.projection fallback", 1);
+                    ApplyCamera();
+                }
+                double t1 = rec?.NowMs ?? 0;
+                RedrawNow(_view);
+                if (rec != null)
+                {
+                    FrameRecorder.Sample("walk.apply ms",  t1 - t0);
+                    FrameRecorder.Sample("walk.redraw ms", rec.NowMs - t1);
+                    FrameRecorder.Sample("walk.mouse px",  Math.Sqrt(mdx * mdx + mdy * mdy));
+                }
             }
         }
 
@@ -699,34 +812,232 @@ namespace WalkMode
             }
         }
 
-        Vector3d ReconstructCameraDirection()
+        /// <summary>
+        /// RhinoView.Redraw() only invalidates; the frame is drawn later when
+        /// WM_PAINT comes through the pump.  Force it to draw now so the camera
+        /// we just set is what appears, with no queueing in between.
+        /// </summary>
+        internal static void RedrawNow(RhinoView view)
         {
-            return new Vector3d(
-                Math.Cos(_pitch) * Math.Sin(_yaw),
-                Math.Cos(_pitch) * Math.Cos(_yaw),
-                Math.Sin(_pitch));
+            var rec = FrameRecorder.Active;
+            double t0 = rec?.NowMs ?? 0;
+            view.Redraw();
+            if (view.Handle != IntPtr.Zero) UpdateWindow(view.Handle);
+            if (rec != null && rec.LastStartMs >= t0)
+            {
+                // Time spent around the pipeline pass: before it starts, and
+                // after it ends (buffer swap / vsync wait).
+                FrameRecorder.Sample("redraw.before-pipeline ms", rec.LastStartMs - t0);
+                FrameRecorder.Sample("redraw.after-pipeline ms",  rec.NowMs - rec.LastEndMs);
+            }
         }
 
-        void ApplyCamera()
+        void ApplyCamera() => ApplyCamera(_mouseNavReady ? _navTargetDist : AcceptTargetDist());
+
+        // Target distance for a view the user keeps (and for the fallback path).
+        double AcceptTargetDist() => Math.Max(_baseSpeed * 10, 10.0 * _unitsPerMeter);
+
+        void ApplyCamera(double targetDist)
         {
-            var dir = ReconstructCameraDirection();
-            // Place target far enough from the camera so Rhino's auto-frustum
-            // calculation doesn't collapse (it bases near/far on camera-to-target
-            // distance).  Also gives a useful target distance on accept.
-            double targetDist = Math.Max(_baseSpeed * 10, 10.0 * _unitsPerMeter);
-            _vp.SetCameraLocations(_camPos + dir * targetDist, _camPos);
+            ApplyCamera(_vp, _camPos, _yaw, _pitch, targetDist, _nearClip);
+            _appliedYaw   = _yaw;
+            _appliedPitch = _pitch;
+            _appliedPos   = _camPos;
         }
 
-        void AdjustFrustum()
+        internal static void ApplyCamera(RhinoViewport vp, Point3d pos, double yaw, double pitch,
+                                         double targetDist, double nearClip)
         {
-            // Rhino's auto-frustum (triggered by SetCameraLocations) bases
-            // near/far on scene extents.  In mm or cm files this pushes the
-            // near plane so far out that nearby walls — or even the whole
-            // scene — get clipped.  Always force our own near/far.
-            var vi = new ViewportInfo(_vp);
-            double far = Math.Max(vi.FrustumFar, _nearClip * 1e6);
-            vi.SetFrustumNearFar(_nearClip, far);
-            _vp.SetViewProjection(vi, false);
+            // Build the whole projection and apply it in one call.  Going via
+            // SetCameraLocations re-runs Rhino's auto near/far (which clips
+            // badly in mm/cm files) and then needs a second update to undo it.
+            var dir = new Vector3d(
+                Math.Cos(pitch) * Math.Sin(yaw),
+                Math.Cos(pitch) * Math.Cos(yaw),
+                Math.Sin(pitch));
+            var right = new Vector3d(Math.Cos(yaw), -Math.Sin(yaw), 0);
+            var up    = Vector3d.CrossProduct(right, dir);
+
+            var vi = new ViewportInfo(vp);
+            vi.SetCameraLocation(pos);
+            vi.SetCameraDirection(dir);
+            vi.SetCameraUp(up);
+            vi.TargetPoint = pos + dir * targetDist;
+            double far = Math.Max(vi.FrustumFar, nearClip * 1e6);
+            vi.SetFrustumNearFar(nearClip, far);
+            vp.SetViewProjection(vi, true);
+            // SetViewProjection aligns Rhino's existing target but does not
+            // copy ViewportInfo.TargetPoint. Set it explicitly: otherwise a
+            // distant scene target makes a single dolly pixel metres wide.
+            vp.SetCameraTarget(pos + dir * targetDist, false);
+        }
+
+        // ── Camera via Rhino's mouse-navigation calls ─────────────────────────
+        // Every "set" camera API (SetViewProjection, SetCameraLocations,
+        // SetCameraLocation, SetCameraDirection, Rotate) makes Rhino redo
+        // ~20 ms of view setup on the next frame in heavy scenes.  The calls
+        // behind Rhino's own mouse navigation — MouseRotateCamera,
+        // MouseLateralDolly, MouseInOutDolly — don't (bench: ~14 ms vs ~36 ms
+        // per frame).  So each frame is expressed as pixel "drags":
+        //   rotate:  MouseRotateCamera   (yaw about world Z, pitch about camera X)
+        //   move:    MouseLateralDolly   (camera X / Y)
+        //            MouseInOutDolly     (camera direction)
+        // Pixel scales are measured at start.  Each frame steers from what the
+        // viewport actually shows, so whole-pixel rounding never accumulates.
+        const double MaxLookPitch = 89.0 * Math.PI / 180.0;
+        const int    ProbePx      = 20;
+        const double WantedMmPerPx = 1.0;   // movement resolution to aim for
+
+        bool    _mouseNavReady;
+        double  _navTargetDist;
+        double  _radPerPxX, _radPerPxY;          // MouseRotateCamera, signed
+        double  _latPerPxX, _latPerPxY;          // MouseLateralDolly, units along CameraX/CameraY, signed
+        double  _dollyPerPx;                     // MouseInOutDolly, units along CameraDirection, signed
+        double  _appliedYaw, _appliedPitch;      // what the viewport shows now
+        Point3d _appliedPos;
+
+        static double WrapAngle(double a) => Math.Atan2(Math.Sin(a), Math.Cos(a));
+
+        void ReadCameraAngles(out double yaw, out double pitch)
+        {
+            var dir = _vp.CameraDirection;
+            dir.Unitize();
+            yaw   = Math.Atan2(dir.X, dir.Y);
+            pitch = Math.Asin(Math.Max(-1.0, Math.Min(1.0, dir.Z)));
+        }
+
+        System.Drawing.Point ViewportCentre() =>
+            new System.Drawing.Point(_vp.Bounds.Width / 2, _vp.Bounds.Height / 2);
+
+        static System.Drawing.Point Offset(System.Drawing.Point p, int dx, int dy) =>
+            new System.Drawing.Point(p.X + dx, p.Y + dy);
+
+        /// <summary>
+        /// Measure the pixel scales of the three navigation calls (they depend
+        /// on Rhino's settings and the target distance), pick a target distance
+        /// that gives ~1 mm per pixel of movement, then restore the camera.
+        /// </summary>
+        void CalibrateMouseNav()
+        {
+            _mouseNavReady = false;
+            var c = ViewportCentre();
+            try
+            {
+                _navTargetDist = AcceptTargetDist();
+                for (int pass = 0; pass < 2; pass++)
+                {
+                    ApplyCamera(_navTargetDist);
+                    var start = new ViewportInfo(_vp);
+                    var startTarget = _vp.CameraTarget;
+                    var X   = _vp.CameraX;         X.Unitize();
+                    var Y   = _vp.CameraY;         Y.Unitize();
+                    var dir = _vp.CameraDirection; dir.Unitize();
+                    var p0  = _vp.CameraLocation;
+
+                    _vp.MouseLateralDolly(c, Offset(c, ProbePx, 0));
+                    _latPerPxX = (_vp.CameraLocation - p0) * X / ProbePx;
+                    _vp.SetViewProjection(start, true);
+                    _vp.SetCameraTarget(startTarget, false);
+
+                    _vp.MouseLateralDolly(c, Offset(c, 0, ProbePx));
+                    _latPerPxY = (_vp.CameraLocation - p0) * Y / ProbePx;
+                    _vp.SetViewProjection(start, true);
+                    _vp.SetCameraTarget(startTarget, false);
+
+                    _vp.MouseInOutDolly(c, Offset(c, 0, ProbePx));
+                    _dollyPerPx = (_vp.CameraLocation - p0) * dir / ProbePx;
+                    _vp.SetViewProjection(start, true);
+                    _vp.SetCameraTarget(startTarget, false);
+
+                    // Scales are proportional to target distance: shrink it so
+                    // the coarsest axis moves ~WantedMmPerPx per pixel.
+                    double coarsest = Math.Max(Math.Abs(_dollyPerPx),
+                                      Math.Max(Math.Abs(_latPerPxX), Math.Abs(_latPerPxY)));
+                    double wanted = WantedMmPerPx * 0.001 * _unitsPerMeter;
+                    if (pass == 0 && coarsest > 1e-12)
+                        _navTargetDist = Math.Max(0.5 * _unitsPerMeter,
+                                         Math.Min(_navTargetDist, _navTargetDist * wanted / coarsest));
+                }
+
+                // Rotation last, from the final target distance.
+                {
+                    var start = new ViewportInfo(_vp);
+                    var startTarget = _vp.CameraTarget;
+                    ReadCameraAngles(out double y0, out double p0);
+                    _vp.MouseRotateCamera(c, Offset(c, ProbePx, 0));
+                    ReadCameraAngles(out double y1, out _);
+                    _vp.SetViewProjection(start, true);
+                    _vp.SetCameraTarget(startTarget, false);
+
+                    _vp.MouseRotateCamera(c, Offset(c, 0, ProbePx));
+                    ReadCameraAngles(out _, out double p1);
+                    _vp.SetViewProjection(start, true);
+                    _vp.SetCameraTarget(startTarget, false);
+
+                    _radPerPxX = WrapAngle(y1 - y0) / ProbePx;
+                    _radPerPxY = (p1 - p0) / ProbePx;
+                }
+
+                const double eps = 1e-9;
+                _mouseNavReady = Math.Abs(_radPerPxX) > eps && Math.Abs(_radPerPxY) > eps
+                              && Math.Abs(_latPerPxX) > eps && Math.Abs(_latPerPxY) > eps
+                              && Math.Abs(_dollyPerPx) > eps;
+            }
+            catch
+            {
+                _mouseNavReady = false;
+            }
+
+            // Leave the viewport exactly at our state, with the chosen target distance.
+            ApplyCamera();
+        }
+
+        static int ToPixels(double amount, double perPx)
+        {
+            double px = amount / perPx;
+            return Math.Abs(px) > 1e6 ? int.MaxValue : (int)Math.Round(px);
+        }
+
+        /// <summary>
+        /// Bring the viewport to (_camPos, _yaw, _pitch) using only mouse-nav
+        /// calls.  Returns false if the caller should fall back to ApplyCamera.
+        /// </summary>
+        bool NavigateViaMouse()
+        {
+            if (!UseMouseNav || !_mouseNavReady) return false;
+            var c = ViewportCentre();
+
+            // 1. Look.
+            int rx = ToPixels(WrapAngle(_yaw - _appliedYaw), _radPerPxX);
+            int ry = ToPixels(_pitch - _appliedPitch,        _radPerPxY);
+            if (rx == int.MaxValue || ry == int.MaxValue) return false;
+            if (rx != 0 || ry != 0)
+            {
+                if (!_vp.MouseRotateCamera(c, Offset(c, rx, ry))) return false;
+                ReadCameraAngles(out _appliedYaw, out _appliedPitch);
+                if (Math.Abs(_appliedPitch) > MaxLookPitch + 0.01)
+                    return false;   // went over the top; let ApplyCamera put it right
+            }
+
+            // 2. Move, in the camera frame as it is after the rotation.
+            var delta = _camPos - _appliedPos;
+            if (delta.SquareLength > 0)
+            {
+                var X   = _vp.CameraX;         X.Unitize();
+                var Y   = _vp.CameraY;         Y.Unitize();
+                var dir = _vp.CameraDirection; dir.Unitize();
+
+                int lx = ToPixels(delta * X,   _latPerPxX);
+                int ly = ToPixels(delta * Y,   _latPerPxY);
+                int dz = ToPixels(delta * dir, _dollyPerPx);
+                if (lx == int.MaxValue || ly == int.MaxValue || dz == int.MaxValue)
+                    return false;   // huge jump: one slow frame is fine
+
+                if ((lx != 0 || ly != 0) && !_vp.MouseLateralDolly(c, Offset(c, lx, ly))) return false;
+                if (dz != 0              && !_vp.MouseInOutDolly(c, Offset(c, 0, dz)))    return false;
+                _appliedPos = _vp.CameraLocation;
+            }
+            return true;
         }
 
         // ── Entry point ───────────────────────────────────────────────────────
@@ -738,35 +1049,76 @@ namespace WalkMode
                 return Result.Cancel;
             }
 
+            if (UseRawInput)
+            {
+                _rawRegistered = RegisterRawMouse(true);
+                if (!_rawRegistered)
+                {
+                    RhinoApp.WriteLine("WalkMode: raw mouse input unavailable, using cursor input.");
+                    UseRawInput = false;
+                }
+                ComputeScreenCenter();   // clip rect depends on the input mode
+            }
+
+            // Measures the mouse-nav pixel scales and leaves the viewport at our
+            // camera state with the target distance and near clip set.
+            if (UseMouseNav) CalibrateMouseNav();
+            else             ApplyCamera();
+
             SetCursorPos(_screenCenter.X, _screenCenter.Y);
+            _hadFocus = RhinoHasFocus();
+            if (_hadFocus) ClipCursor(ref _screenClip);
+
+            string prevTag = FrameRecorder.Tag;
+            FrameRecorder.Tag = (UseRawInput ? "walk-raw" : "walk-cursor")
+                              + (UseMouseNav && _mouseNavReady ? "-nav" : "");
 
             RhinoApp.SetCommandPrompt(
                 "Walk  WASD·move  Mouse·look  Tab·gravity  V·jump  Space·teleport  Scroll·speed  Esc·exit");
 
             try
             {
-                // Manual message pump — lightest possible loop.
-                // Input now flushes a frame on the same message cycle, while
-                // movement and gravity continue on a paced 250 Hz loop.
+                // Manual message pump.  Walk input is filtered off the queue
+                // and everything else dispatched normally.  WM_MOUSEMOVE is
+                // coalesced by Windows, so a burst of motion costs one frame
+                // and the cursor offset read in TickFrame covers all of it.
+                _lastTickMs = _sw.ElapsedMilliseconds;
                 long nextTickMs = _lastTickMs;
+                IsRunning = true;
                 while (!_exitRequested)
                 {
-                    bool inputFrameRequested = false;
+                    bool gotInput = false;
+                    double pumpStartMs = _sw.Elapsed.TotalMilliseconds;
+                    int messageCount = 0;
                     while (PeekMessage(out var msg, IntPtr.Zero, 0, 0, PM_REMOVE))
                     {
-                        TranslateMessage(ref msg);
-                        DispatchMessage(ref msg);
-
-                        if (_mouseDx != 0 || _mouseDy != 0 || _redrawPending)
+                        bool consumed = false;
+                        if (msg.message == WM_INPUT)
                         {
-                            inputFrameRequested = true;
-                            break;
+                            // Read, then still dispatch: DefWindowProc must free it.
+                            if (UseRawInput) { ReadRawInput(msg.lParam); gotInput = true; }
                         }
+                        else if (FilterInput(ref msg)) { gotInput = true; consumed = true; }
+                        if (!consumed)
+                        {
+                            TranslateMessage(ref msg);
+                            DispatchMessage(ref msg);
+                        }
+                        messageCount++;
+                        if (_exitRequested || _sw.Elapsed.TotalMilliseconds - pumpStartMs >= MessagePumpBudgetMs)
+                            break;
+                    }
+                    if (_exitRequested) break;
+
+                    if (FrameRecorder.IsRecording && messageCount > 0)
+                    {
+                        FrameRecorder.Sample("walk.pump ms", _sw.Elapsed.TotalMilliseconds - pumpStartMs);
+                        FrameRecorder.Sample("walk.pump messages", messageCount);
                     }
 
                     long nowMs = _sw.ElapsedMilliseconds;
                     bool needsTick = NeedsContinuousTick();
-                    bool shouldTick = inputFrameRequested || _redrawPending || (needsTick && nowMs >= nextTickMs);
+                    bool shouldTick = gotInput || _redrawPending || (needsTick && nowMs >= nextTickMs);
 
                     if (shouldTick)
                     {
@@ -789,6 +1141,8 @@ namespace WalkMode
             }
             finally
             {
+                IsRunning = false;
+                FrameRecorder.Tag = prevTag;
                 Cleanup();
             }
 
@@ -798,12 +1152,17 @@ namespace WalkMode
                 return Result.Cancel;
             }
 
+            // Walking used a short target distance for fine dolly steps; give
+            // the kept view a sensible one (and our near clip) again.
+            ApplyCamera(AcceptTargetDist());
+            _view.Redraw();
             return Result.Success;
         }
 
         void RestoreCamera()
         {
             _vp.SetViewProjection(_savedViewport, false);
+            _vp.SetCameraTarget(_savedCameraTarget, false);
         }
 
         // ── Cleanup ───────────────────────────────────────────────────────────
@@ -819,8 +1178,13 @@ namespace WalkMode
 
             timeEndPeriod(1);
 
-            if (_kHook != IntPtr.Zero) { UnhookWindowsHookEx(_kHook); _kHook = IntPtr.Zero; }
-            if (_mHook != IntPtr.Zero) { UnhookWindowsHookEx(_mHook); _mHook = IntPtr.Zero; }
+            ClipCursorNone(IntPtr.Zero);
+            if (_rawRegistered) { RegisterRawMouse(false); _rawRegistered = false; }
+            if (_rawInputBuffer != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(_rawInputBuffer);
+                _rawInputBuffer = IntPtr.Zero;
+            }
 
             RhinoDoc.AddRhinoObject         -= _objHandler;
             RhinoDoc.DeleteRhinoObject      -= _objHandler;
