@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -144,8 +144,9 @@ namespace WalkMode
 
         // ── Input state — written by the message filter, read by physics tick ─
         bool _kW, _kA, _kS, _kD, _kQ, _kE, _kShift, _kAlt;
-        bool _tabEdge, _vEdge, _spaceEdge;
-        bool _kTabDown, _kVDown, _kSpaceDown;
+        bool _tabEdge, _vEdge, _spaceEdge, _cEdge, _xEdge;
+        bool _kTabDown, _kVDown, _kSpaceDown, _kCDown, _kXDown;
+        int  _lensStep;   // +1 / -1 per bracket press, applied in the tick
         bool _rButtonDown;
 
         // ── Exit flags (replace GetPoint's Get() return) ─────────────────────
@@ -156,7 +157,6 @@ namespace WalkMode
         bool   _gravityEnabled;
         double _verticalVelocity;
         bool   _grounded;
-        double _gravityProbeAccum;
         double _lastFloorZ;
         bool   _lastFloorValid;
 
@@ -166,8 +166,22 @@ namespace WalkMode
         DateTime _teleportStart;
         double   _teleportDuration;
 
+        // ── Human-scale walking (all in doc units) ────────────────────────────
+        double _eyeStanding, _eyeSeated;   // eye level above the floor
+        double _eyeCur;                    // eased toward the active one
+        bool   _seated;
+        double _stepHeight;
+        double _bodyRadius;
+        double _walkSpeed;                 // used while walking; _baseSpeed while flying
+        bool   _collision;
+        bool   _stepSettling;              // easing onto a stair tread
+        double _lensMm;                    // current 35 mm lens length
+
+        double EyeTarget => _seated ? _eyeSeated : _eyeStanding;
+
         // ── Scene geometry ────────────────────────────────────────────────────
-        Mesh[]   _meshGeometry;
+        Mesh[]        _meshGeometry;
+        BoundingBox[] _meshBoxes;
         bool     _geometryDirty;
         DateTime _lastGeometryRebuild;
 
@@ -271,12 +285,29 @@ namespace WalkMode
 
             void DrawStatus(DrawEventArgs e)
             {
-                double speedMs = _owner._baseSpeed / _owner._unitsPerMeter;
-                string grav    = _owner._gravityEnabled ? "Gravity ON" : "Gravity OFF";
-                string text    = $"{grav}   Speed {speedMs:F1} m/s";
-                int    y       = _owner._vp.Bounds.Height - 24;
-                e.Display.Draw2dText(text, System.Drawing.Color.White,
-                    new Point2d(10, y), false, 13);
+                var    o       = _owner;
+                double u       = o._unitsPerMeter;
+                double speedMs = o.CurrentBaseSpeed / u;
+                string text;
+                if (o._gravityEnabled)
+                {
+                    string pose = o._seated ? "seated" : "standing";
+                    string coll = o._collision ? "Walls ON" : "Walls OFF";
+                    text = $"WALK   Eye {o.EyeTarget / u:F2} m ({pose})   {coll}   Speed {speedMs:F1} m/s   Lens {o._lensMm:F0} mm";
+                    if (!o._lastFloorValid && !o._grounded) text += "   (no floor below)";
+                }
+                else
+                {
+                    text = $"FLY   Speed {speedMs:F1} m/s   Lens {o._lensMm:F0} mm";
+                }
+                int y = o._vp.Bounds.Height - 24;
+                // Dark outline keeps the HUD readable over bright walls.
+                var shadow = System.Drawing.Color.FromArgb(160, 0, 0, 0);
+                e.Display.Draw2dText(text, shadow, new Point2d(11, y + 1), false, 13);
+                e.Display.Draw2dText(text, System.Drawing.Color.White, new Point2d(10, y), false, 13);
+                const string keys = "WASD move · Shift run · Alt slow · C seated · X walls · [ ] lens · Tab walk/fly · V jump · Space teleport";
+                e.Display.Draw2dText(keys, shadow, new Point2d(11, y - 19), false, 11);
+                e.Display.Draw2dText(keys, System.Drawing.Color.Gainsboro, new Point2d(10, y - 20), false, 11);
             }
         }
 
@@ -310,8 +341,20 @@ namespace WalkMode
             _pitch = Math.Asin(Math.Max(-1.0, Math.Min(1.0, dir.Z)));
             _camPos = _vp.CameraLocation;
 
+            double u = _unitsPerMeter;
+            _eyeStanding    = WalkSettings.EyeHeight       * u;
+            _eyeSeated      = WalkSettings.SeatedEyeHeight * u;
+            _eyeCur         = _eyeStanding;
+            _stepHeight     = WalkSettings.StepHeight      * u;
+            _bodyRadius     = WalkSettings.BodyRadius      * u;
+            _walkSpeed      = WalkSettings.WalkSpeed       * u;
+            _collision      = WalkSettings.Collision;
+            _gravityEnabled = WalkSettings.StartWalking;
+            _lensMm         = _vp.Camera35mmLensLength;
+
             _lastBounds = _vp.Bounds;
-            _nearClip = 0.1 * _unitsPerMeter;
+            // Closer than the body radius, so walls you stand against never clip.
+            _nearClip = Math.Min(0.1 * u, 0.5 * _bodyRadius);
             ComputeScreenCenter();
 
             using (var proc = Process.GetCurrentProcess())
@@ -343,8 +386,24 @@ namespace WalkMode
         void BuildGeometryCache()
         {
             var meshes = new List<Mesh>();
-            CollectGeometry(_doc.Objects, Transform.Identity, meshes);
+            // VisibleFilter also drops objects on layers that are turned off.
+            var settings = new ObjectEnumeratorSettings
+            {
+                VisibleFilter     = true,
+                HiddenObjects     = false,
+                LockedObjects     = true,
+                NormalObjects     = true,
+                ReferenceObjects  = true,
+                IncludeLights     = false,
+                IncludeGrips      = false,
+                ObjectTypeFilter  = ObjectType.Mesh | ObjectType.Brep | ObjectType.Surface
+                                  | ObjectType.Extrusion | ObjectType.SubD | ObjectType.InstanceReference,
+            };
+            CollectGeometry(_doc.Objects.GetObjectList(settings), Transform.Identity, meshes);
             _meshGeometry  = meshes.ToArray();
+            _meshBoxes     = new BoundingBox[_meshGeometry.Length];
+            for (int i = 0; i < _meshGeometry.Length; i++)
+                _meshBoxes[i] = _meshGeometry[i].GetBoundingBox(false);
             _geometryDirty = false;
         }
 
@@ -369,11 +428,13 @@ namespace WalkMode
                 {
                     source = new[] { m };
                 }
-                else if (geom is Brep || geom is Surface)
+                else if (geom is Brep || geom is Surface || geom is Extrusion || geom is SubD)
                 {
+                    // Extrusions are what Rhino's Box/slab commands make: without
+                    // them gravity fell straight through most architectural floors.
                     source = obj.GetMeshes(MeshType.Render);
-                    if ((source == null || source.Length == 0) && geom is Brep brep)
-                        source = Mesh.CreateFromBrep(brep, MeshingParameters.FastRenderMesh);
+                    if (source == null || source.Length == 0)
+                        source = FallbackMesh(geom);
                 }
 
                 if (source == null) continue;
@@ -394,7 +455,53 @@ namespace WalkMode
             }
         }
 
-        Point3d? ShootRay(Ray3d ray)
+        static Mesh[] FallbackMesh(GeometryBase geom)
+        {
+            var mp = MeshingParameters.FastRenderMesh;
+            switch (geom)
+            {
+                case Brep b:      return Mesh.CreateFromBrep(b, mp);
+                case Extrusion x: var xb = x.ToBrep(); return xb == null ? null : Mesh.CreateFromBrep(xb, mp);
+                case SubD s:      var sm = Mesh.CreateFromSubD(s, 2); return sm == null ? null : new[] { sm };
+                case Surface f:   var fm = Mesh.CreateFromSurface(f, mp); return fm == null ? null : new[] { fm };
+            }
+            return null;
+        }
+
+        /// <summary>Slab test: does the ray hit the box within maxDist?</summary>
+        static bool RayHitsBox(in BoundingBox b, Point3d o, Vector3d d, double maxDist)
+        {
+            double tMin = 0, tMax = maxDist;
+            for (int axis = 0; axis < 3; axis++)
+            {
+                double oa = o[axis], da = d[axis], lo = b.Min[axis], hi = b.Max[axis];
+                if (Math.Abs(da) < 1e-12)
+                {
+                    if (oa < lo || oa > hi) return false;
+                    continue;
+                }
+                double t1 = (lo - oa) / da, t2 = (hi - oa) / da;
+                if (t1 > t2) { var tmp = t1; t1 = t2; t2 = tmp; }
+                if (t1 > tMin) tMin = t1;
+                if (t2 < tMax) tMax = t2;
+                if (tMin > tMax) return false;
+            }
+            return true;
+        }
+
+        static Vector3d FaceNormal(Mesh mesh, int faceIndex)
+        {
+            if (faceIndex < 0 || faceIndex >= mesh.Faces.Count) return Vector3d.Unset;
+            var f = mesh.Faces[faceIndex];
+            var v = mesh.Vertices;
+            Point3d a = v[f.A], b = v[f.B], c = v[f.C];
+            var n = f.IsQuad
+                ? Vector3d.CrossProduct(c - a, (Point3d)v[f.D] - b)
+                : Vector3d.CrossProduct(b - a, c - a);
+            return n.Unitize() ? n : Vector3d.Unset;
+        }
+
+        void EnsureGeometry()
         {
             if (_meshGeometry == null || _geometryDirty)
             {
@@ -415,24 +522,43 @@ namespace WalkMode
                     }
                 }
             }
+        }
 
-            Point3d? closest     = null;
-            double   closestDist = double.MaxValue;
+        Point3d? ShootRay(Ray3d ray) => ShootRay(ray, double.MaxValue, out _, out _);
 
-            if (_meshGeometry != null)
+        /// <summary>
+        /// Nearest hit along a ray within maxDist (doc units). Meshes whose
+        /// bounding box the ray misses are skipped before the exact test, so
+        /// the several probes per frame stay cheap in large models.
+        /// </summary>
+        Point3d? ShootRay(Ray3d ray, double maxDist, out double hitDist, out Vector3d normal)
+        {
+            EnsureGeometry();
+            hitDist = double.MaxValue;
+            normal  = Vector3d.Unset;
+
+            var dir = ray.Direction;
+            if (!dir.Unitize() || _meshGeometry == null) return null;
+            var unitRay = new Ray3d(ray.Position, dir);
+
+            Mesh bestMesh = null;
+            int  bestFace = -1;
+            for (int i = 0; i < _meshGeometry.Length; i++)
             {
-                foreach (var mesh in _meshGeometry)
+                double limit = Math.Min(maxDist, hitDist);
+                if (!RayHitsBox(_meshBoxes[i], unitRay.Position, dir, limit)) continue;
+                double t = Intersection.MeshRay(_meshGeometry[i], unitRay, out int[] faces);
+                if (t >= 0 && t < limit)
                 {
-                    double t = Intersection.MeshRay(mesh, ray);
-                    if (t >= 0 && t < closestDist)
-                    {
-                        closestDist = t;
-                        closest = ray.Position + ray.Direction * t;
-                    }
+                    hitDist  = t;
+                    bestMesh = _meshGeometry[i];
+                    bestFace = faces != null && faces.Length > 0 ? faces[0] : -1;
                 }
             }
 
-            return closest;
+            if (bestMesh == null) return null;
+            normal = FaceNormal(bestMesh, bestFace);
+            return unitRay.Position + dir * hitDist;
         }
 
         void ComputeScreenCenter()
@@ -500,15 +626,28 @@ namespace WalkMode
         void ReleaseHeldKeys()
         {
             _kW = _kA = _kS = _kD = _kQ = _kE = _kShift = _kAlt = false;
-            _kTabDown = _kVDown = _kSpaceDown = _rButtonDown = false;
+            _kTabDown = _kVDown = _kSpaceDown = _kCDown = _kXDown = _rButtonDown = false;
         }
+
+        /// <summary>Walking keeps its own human pace; flying keeps the scene-scaled one.</summary>
+        double CurrentBaseSpeed => _gravityEnabled ? _walkSpeed : _baseSpeed;
 
         void OnWheelDelta(int delta)
         {
-            if (delta > 0) _baseSpeed *= 1.2;
-            else           _baseSpeed /= 1.2;
-            _baseSpeed = Math.Max(0.1 * _unitsPerMeter, Math.Min(_baseSpeed, 100.0 * _unitsPerMeter));
-            s_lastSpeed = _baseSpeed;
+            double u = _unitsPerMeter;
+            if (_gravityEnabled)
+            {
+                _walkSpeed *= delta > 0 ? 1.1 : 1 / 1.1;
+                _walkSpeed = Math.Max(0.3 * u, Math.Min(_walkSpeed, 6.0 * u));
+                WalkSettings.WalkSpeed = _walkSpeed / u;
+            }
+            else
+            {
+                if (delta > 0) _baseSpeed *= 1.2;
+                else           _baseSpeed /= 1.2;
+                _baseSpeed = Math.Max(0.1 * u, Math.Min(_baseSpeed, 100.0 * u));
+                s_lastSpeed = _baseSpeed;
+            }
             _redrawPending = true;
         }
 
@@ -543,6 +682,20 @@ namespace WalkMode
                     case Keys.Space:
                         if (down && !_kSpaceDown) _spaceEdge = true;
                         _kSpaceDown = down;
+                        return true;
+                    case Keys.C:
+                        if (down && !_kCDown) _cEdge = true;
+                        _kCDown = down;
+                        return true;
+                    case Keys.X:
+                        if (down && !_kXDown) _xEdge = true;
+                        _kXDown = down;
+                        return true;
+                    case Keys.OemOpenBrackets:
+                        if (down) _lensStep--;
+                        return true;
+                    case Keys.OemCloseBrackets:
+                        if (down) _lensStep++;
                         return true;
                     case Keys.Escape:
                         if (down) { _cancelled = true; _exitRequested = true; }
@@ -672,7 +825,8 @@ namespace WalkMode
         bool NeedsContinuousTick()
         {
             if (_teleporting) return true;
-            if (_gravityEnabled && !_grounded) return true;
+            if (_gravityEnabled && (!_grounded || _stepSettling)) return true;
+            if (_gravityEnabled && Math.Abs(_eyeCur - EyeTarget) > 1e-6 * _unitsPerMeter) return true;
             if (_kW || _kA || _kS || _kD) return true;
             if (!_gravityEnabled && (_kQ || _kE)) return true;
             return false;
@@ -680,9 +834,18 @@ namespace WalkMode
 
         bool ProcessKeyboardMovement(double dt)
         {
-            double speed = _baseSpeed;
-            if (_kShift) speed *= 5.0;
-            if (_kAlt)   speed *= 0.2;
+            double speed = CurrentBaseSpeed;
+            if (_gravityEnabled)
+            {
+                // A person jogs at ~2-3x walking pace, not 5x.
+                if (_kShift) speed *= 2.2;
+                if (_kAlt)   speed *= 0.5;
+            }
+            else
+            {
+                if (_kShift) speed *= 5.0;
+                if (_kAlt)   speed *= 0.2;
+            }
 
             var fwd   = new Vector3d( Math.Sin(_yaw),  Math.Cos(_yaw), 0);
             var right = new Vector3d( Math.Cos(_yaw), -Math.Sin(_yaw), 0);
@@ -702,46 +865,155 @@ namespace WalkMode
             if (move.SquareLength > 0)
             {
                 move.Unitize();
-                _camPos = _camPos + move * (speed * dt);
+                var delta = move * (speed * dt);
+                if (_gravityEnabled && _collision) delta = CollideAndSlide(delta);
+                if (delta.SquareLength == 0) return false;
+                _camPos = _camPos + delta;
                 return true;
             }
             return false;
         }
 
+        double FeetZ => _camPos.Z - _eyeCur;
+
+        // The tread you stand on, not the eased feet: while easing up a stair
+        // the feet lag behind, which made the knee probe hit the next riser
+        // and the floor probe start inside the step.
+        double SupportZ => _grounded && _lastFloorValid ? _lastFloorZ : FeetZ;
+
+        // A probe starting exactly on the floor can miss it (StepHeight 0).
+        double ProbeLift => Math.Max(_stepHeight, 0.02 * _unitsPerMeter);
+
+        /// <summary>
+        /// Body as a vertical stack of probes from just above step height to
+        /// the eye. Movement stops at body radius from the nearest wall and
+        /// the rest of the step slides along it, so you can walk along walls
+        /// and through doorways instead of sticking or passing through.
+        /// </summary>
+        Vector3d CollideAndSlide(Vector3d delta)
+        {
+            var result = Vector3d.Zero;
+            var pos    = _camPos;
+            for (int iter = 0; iter < 3 && delta.SquareLength > 1e-18; iter++)
+            {
+                double len = delta.Length;
+                var dir  = delta / len;
+                var side = new Vector3d(-dir.Y, dir.X, 0);
+
+                // Just above step height: anything you can't step onto blocks you.
+                double low  = SupportZ + _stepHeight + 0.01 * _unitsPerMeter;
+                double high = pos.Z;
+                // Knee, table, chest and eye level.
+                double[] heights = low < high
+                    ? new[] { low, low + (high - low) / 3, low + 2 * (high - low) / 3, high }
+                    : new[] { high };
+
+                double   best  = double.MaxValue;
+                Vector3d bestN = Vector3d.Unset;
+                foreach (double h in heights)
+                    foreach (double o in SideOffsets)
+                    {
+                        var origin = new Point3d(pos.X, pos.Y, h) + side * (o * _bodyRadius);
+                        // Side probes start off-centre: the body edge is closer to them.
+                        double edge  = _bodyRadius * Math.Sqrt(1 - o * o);
+                        if (ShootRay(new Ray3d(origin, dir), len + edge, out double t, out Vector3d n) == null) continue;
+                        double gap = t - edge;
+                        if (gap < best) { best = gap; bestN = n; }
+                    }
+
+                if (best >= len) { result += delta; break; }
+
+                double allowed = Math.Max(0, best - 0.002 * _unitsPerMeter);
+                result += dir * allowed;
+                pos    += dir * allowed;
+
+                // Slide: drop the component pushing into the wall (horizontal normal).
+                var n2 = bestN.IsValid ? new Vector3d(bestN.X, bestN.Y, 0) : -dir;
+                if (!n2.Unitize()) n2 = -dir;
+                if (n2 * dir > 0) n2 = -n2;
+                var rest = dir * (len - allowed);
+                rest -= n2 * (rest * n2);
+                // Don't let a corner bounce us backwards.
+                if (rest * dir <= 0) break;
+                delta = rest;
+            }
+            return result;
+        }
+
+        static readonly double[] SideOffsets = { 0.0, 0.7, -0.7 };
+
         bool ProcessGravity(double dt)
         {
-            double g         = -9.8  * _unitsPerMeter;
-            double terminal  = -50.0 * _unitsPerMeter;
-            double eyeHeight =  1.75 * _unitsPerMeter;
+            double u        = _unitsPerMeter;
+            double g        = -9.8  * u;
+            double terminal = -50.0 * u;
+            double prevZ    = _camPos.Z;
 
-            double prevZ = _camPos.Z;
-
-            _verticalVelocity += g * dt;
-            if (_verticalVelocity < terminal) _verticalVelocity = terminal;
-            _camPos.Z += _verticalVelocity * dt;
-
-            const double ProbeHz = 30.0;
-            _gravityProbeAccum += dt;
-            if (_gravityProbeAccum >= 1.0 / ProbeHz)
+            // Sitting down / standing up eases over ~0.3 s instead of snapping.
+            double eyeGoal = EyeTarget;
+            if (Math.Abs(_eyeCur - eyeGoal) > 1e-6 * u)
             {
-                _gravityProbeAccum = 0;
-                var floor = ShootRay(new Ray3d(_camPos, -Vector3d.ZAxis));
-                _lastFloorValid = floor.HasValue;
-                if (floor.HasValue) _lastFloorZ = floor.Value.Z;
+                double feetBefore = FeetZ;
+                _eyeCur += (eyeGoal - _eyeCur) * (1 - Math.Exp(-dt * 12.0));
+                if (Math.Abs(_eyeCur - eyeGoal) < 0.001 * u) _eyeCur = eyeGoal;
+                _camPos.Z = feetBefore + _eyeCur;
             }
 
-            _grounded = false;
-            if (_lastFloorValid)
+            double feet  = FeetZ;
+            double baseZ = SupportZ;
+
+            // Probe from step height, not from the eye: a table or railing
+            // under your head is no longer mistaken for the floor.
+            var floor = ShootRay(new Ray3d(new Point3d(_camPos.X, _camPos.Y, baseZ + ProbeLift), -Vector3d.ZAxis));
+            _lastFloorValid = floor.HasValue;
+            if (floor.HasValue) _lastFloorZ = floor.Value.Z;
+
+            if (_grounded)
             {
-                double minZ = _lastFloorZ + eyeHeight;
-                if (_camPos.Z <= minZ)
+                if (_lastFloorValid && _lastFloorZ >= baseZ - _stepHeight)
                 {
-                    _camPos.Z         = minZ;
+                    // Up or down a stair tread: ease the body onto it.
+                    double diff = _lastFloorZ - feet;
+                    if (Math.Abs(diff) < 0.001 * u)
+                    {
+                        feet = _lastFloorZ;
+                        _stepSettling = false;
+                    }
+                    else
+                    {
+                        feet += diff * (1 - Math.Exp(-dt * 18.0));
+                        _stepSettling = true;
+                    }
                     _verticalVelocity = 0;
-                    _grounded         = true;
+                }
+                else
+                {
+                    _grounded     = false;   // walked off a ledge
+                    _stepSettling = false;
                 }
             }
 
+            if (!_grounded)
+            {
+                _verticalVelocity += g * dt;
+                if (_verticalVelocity < terminal) _verticalVelocity = terminal;
+                feet += _verticalVelocity * dt;
+                if (_lastFloorValid && feet <= _lastFloorZ)
+                {
+                    feet              = _lastFloorZ;
+                    _verticalVelocity = 0;
+                    _grounded         = true;
+                }
+                else if (!_lastFloorValid && _verticalVelocity < -20.0 * u)
+                {
+                    // Nothing below to land on: stop falling forever and fly.
+                    _gravityEnabled   = false;
+                    _verticalVelocity = 0;
+                    RhinoApp.WriteLine("WalkMode: no floor below, switched to fly mode (Tab to walk).");
+                }
+            }
+
+            _camPos.Z = feet + _eyeCur;
             return Math.Abs(_camPos.Z - prevZ) > 1e-9;
         }
 
@@ -757,7 +1029,27 @@ namespace WalkMode
             {
                 _teleporting      = false;
                 _verticalVelocity = 0;
+                _grounded         = false;   // the next gravity tick settles onto the floor
             }
+        }
+
+        /// <summary>Floor under (x, y), searching down from z.</summary>
+        bool FindFloor(double x, double y, double z, out double floorZ)
+        {
+            var hit = ShootRay(new Ray3d(new Point3d(x, y, z), -Vector3d.ZAxis));
+            floorZ = hit?.Z ?? 0;
+            return hit.HasValue;
+        }
+
+        void StartTeleport(Point3d target)
+        {
+            double dist = _camPos.DistanceTo(target);
+            if (dist < 0.01 * _unitsPerMeter) return;
+            _teleportOrigin   = _camPos;
+            _teleportTarget   = target;
+            _teleportStart    = DateTime.UtcNow;
+            _teleportDuration = Math.Max(0.06, Math.Min(0.15, dist / (20.0 * _unitsPerMeter)));
+            _teleporting      = true;
         }
 
         void BeginTeleport()
@@ -771,14 +1063,82 @@ namespace WalkMode
             }
 
             if (!hit.IsValid) return;
-            double dist = _camPos.DistanceTo(hit);
-            if (dist < 0.1 * _unitsPerMeter) return;
+            if (_camPos.DistanceTo(hit) < 0.1 * _unitsPerMeter) return;
 
-            _teleportOrigin   = _camPos;
-            _teleportTarget   = new Point3d(hit.X, hit.Y, hit.Z + 1.75 * _unitsPerMeter);
-            _teleportStart    = DateTime.UtcNow;
-            _teleportDuration = Math.Max(0.06, Math.Min(0.15, dist / (20.0 * _unitsPerMeter)));
-            _teleporting      = true;
+            // Stop a body radius short of what you aimed at, so aiming at a
+            // wall puts you in front of it rather than inside it.
+            var horiz = new Vector3d(hit.X - _camPos.X, hit.Y - _camPos.Y, 0);
+            var spot  = hit;
+            if (horiz.Unitize()) spot -= horiz * (_bodyRadius * 1.2);
+
+            // Aiming up at a ceiling means the floor under it, not the slab above.
+            double searchZ = hit.Z > _camPos.Z ? hit.Z - 0.05 * _unitsPerMeter : hit.Z + ProbeLift;
+            double z = hit.Z + _eyeCur;
+            if (_gravityEnabled
+                && FindFloor(spot.X, spot.Y, searchZ, out double floorZ)
+                && floorZ > hit.Z - 3.0 * _unitsPerMeter)
+                z = floorZ + _eyeCur;
+
+            StartTeleport(new Point3d(spot.X, spot.Y, z));
+        }
+
+        /// <summary>
+        /// At start, put the eye at standing height over the floor below the
+        /// camera. If there is no floor (empty sky), fly instead.
+        /// </summary>
+        void SnapToFloorAtStart()
+        {
+            if (!_gravityEnabled) return;
+            if (FindFloor(_camPos.X, _camPos.Y, _camPos.Z, out double floorZ))
+            {
+                _camPos.Z = floorZ + _eyeCur;
+                _grounded = true;
+                _lastFloorValid = true;
+                _lastFloorZ = floorZ;
+            }
+            else
+            {
+                _gravityEnabled = false;
+                RhinoApp.WriteLine("WalkMode: no floor below the camera, starting in fly mode (Tab to walk).");
+            }
+        }
+
+        static readonly double[] LensPresets = { 12, 14, 16, 18, 20, 24, 28, 35, 40, 50, 70, 85 };
+
+        void ApplyLens(double mm)
+        {
+            if (mm > 0 && Math.Abs(mm - _vp.Camera35mmLensLength) > 0.01)
+            {
+                _vp.Camera35mmLensLength = mm;
+                // Pixel scales of the mouse-nav calls depend on the field of view.
+                if (UseMouseNav) CalibrateMouseNav();
+                else             ApplyCamera();
+            }
+            _lensMm = _vp.Camera35mmLensLength;
+        }
+
+        void StepLens(int steps)
+        {
+            double cur = _vp.Camera35mmLensLength;
+            // Past the last preset in that direction: keep the lens rather
+            // than jump the other way (e.g. ] at 100 mm went to 85 mm).
+            int idx = -1;
+            if (steps > 0)
+            {
+                for (int i = 0; i < LensPresets.Length; i++)
+                    if (LensPresets[i] > cur + 0.5) { idx = i; break; }
+                if (idx < 0) return;
+                idx = Math.Min(LensPresets.Length - 1, idx + steps - 1);
+            }
+            else
+            {
+                for (int i = LensPresets.Length - 1; i >= 0; i--)
+                    if (LensPresets[i] < cur - 0.5) { idx = i; break; }
+                if (idx < 0) return;
+                idx = Math.Max(0, idx + steps + 1);
+            }
+            ApplyLens(LensPresets[idx]);
+            WalkSettings.Lens = _lensMm;
         }
 
         void ProcessToggles()
@@ -786,12 +1146,11 @@ namespace WalkMode
             if (_tabEdge)
             {
                 _tabEdge = false;
-                _gravityEnabled = !_gravityEnabled;
-                if (!_gravityEnabled)
-                {
-                    _verticalVelocity = 0;
-                    _grounded = false;
-                }
+                _gravityEnabled   = !_gravityEnabled;
+                _verticalVelocity = 0;
+                _grounded         = false;
+                _stepSettling     = false;
+                if (_gravityEnabled) _eyeCur = EyeTarget;
                 _redrawPending = true;
             }
 
@@ -800,9 +1159,33 @@ namespace WalkMode
                 _vEdge = false;
                 if (_gravityEnabled && _grounded)
                 {
-                    _verticalVelocity = 5.0 * _unitsPerMeter;
-                    _grounded = false;
+                    // ~0.45 m hop: a person's jump, not a 1.3 m leap.
+                    _verticalVelocity = 3.0 * _unitsPerMeter;
+                    _grounded     = false;
+                    _stepSettling = false;
                 }
+            }
+
+            if (_cEdge)
+            {
+                _cEdge = false;
+                _seated = !_seated;
+                _redrawPending = true;
+            }
+
+            if (_xEdge)
+            {
+                _xEdge = false;
+                _collision = !_collision;
+                _redrawPending = true;
+            }
+
+            if (_lensStep != 0)
+            {
+                int s = _lensStep;
+                _lensStep = 0;
+                StepLens(s);
+                _redrawPending = true;
             }
 
             if (_spaceEdge)
@@ -1060,6 +1443,10 @@ namespace WalkMode
                 ComputeScreenCenter();   // clip rect depends on the input mode
             }
 
+            if (WalkSettings.Lens > 0) _vp.Camera35mmLensLength = WalkSettings.Lens;
+            _lensMm = _vp.Camera35mmLensLength;
+            SnapToFloorAtStart();
+
             // Measures the mouse-nav pixel scales and leaves the viewport at our
             // camera state with the target distance and near clip set.
             if (UseMouseNav) CalibrateMouseNav();
@@ -1074,7 +1461,7 @@ namespace WalkMode
                               + (UseMouseNav && _mouseNavReady ? "-nav" : "");
 
             RhinoApp.SetCommandPrompt(
-                "Walk  WASD·move  Mouse·look  Tab·gravity  V·jump  Space·teleport  Scroll·speed  Esc·exit");
+                "Walk  WASD·move  Mouse·look  C·seated  X·walls  [ ]·lens  Tab·walk/fly  V·jump  Space·teleport  Scroll·speed  Esc·exit");
 
             try
             {
